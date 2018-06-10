@@ -3,22 +3,71 @@
 #include <dontuse.h>
 #include <suppress.h>
 
+#include "common.h"
+#include "ctx.h"
+
 #pragma prefast(disable:__WARNING_ENCODE_MEMBER_FUNCTION_POINTER, "Not valid for kernel mode drivers")
 
 
 PFLT_FILTER gFilterHandle;
 ULONG_PTR OperationStatusCtx = 1;
 
-#define PTDBG_TRACE_ROUTINES            0x00000001
-#define PTDBG_TRACE_OPERATION_STATUS    0x00000002
+#define LOG_INFO				0x00000001
+#define LOG_ERROR				0x00000002
+#define LOG_CREATE				0x00000004
+#define LOG_READ				0x00000008
+#define LOG_WRITE				0x00000010
+#define LOG_DIRCTRL				0x00000020
 
-ULONG gTraceFlags = 1;
+ULONG gLogFlags = 3;		//调试信息输出开关
 
 
-#define PT_DBG_PRINT( _dbgLevel, _string )          \
-	(FlagOn(gTraceFlags, (_dbgLevel)) ? \
+#define LOG_PRINT( _logFlag, _string )          \
+	(FlagOn(gLogFlags, (_logFlag)) ? \
 	DbgPrint _string : \
 	((int)0))
+
+/*************************************************************************
+Pool Tags
+*************************************************************************/
+#define BUFFER_SWAP_TAG     'bdBS'
+#define CONTEXT_TAG         'xcBS'
+#define NAME_TAG            'mnBS'
+#define PRE_2_POST_TAG      'ppBS'
+
+
+/*************************************************************************
+Local structures
+*************************************************************************/
+#define MIN_SECTOR_SIZE 0x200
+
+//
+//  This is a context structure that is used to pass state from our
+//  pre-operation callback to our post-operation callback.
+//
+typedef struct _PRE_2_POST_CONTEXT {
+	//
+	//  Pointer to our volume context structure.  We always get the context
+	//  in the preOperation path because you can not safely get it at DPC
+	//  level.  We then release it in the postOperation path.  It is safe
+	//  to release contexts at DPC level.
+	//
+	PVOLUME_CONTEXT VolCtx;
+
+	PSTREAM_CONTEXT pStreamCtx;
+
+	//
+	//  Since the post-operation parameters always receive the "original"
+	//  parameters passed to the operation, we need to pass our new destination
+	//  buffer to our post operation routine so we can free it.
+	//
+	PVOID SwappedBuffer;
+
+} PRE_2_POST_CONTEXT, *PPRE_2_POST_CONTEXT;
+//
+//  This is a lookAside list used to allocate our pre-2-post structure.
+//
+NPAGED_LOOKASIDE_LIST Pre2PostContextList;
 
 /*************************************************************************
 	框架定义函数
@@ -53,7 +102,7 @@ _In_ FLT_INSTANCE_TEARDOWN_FLAGS Flags
 );
 
 NTSTATUS
-CryptMiniUnload(
+DriveExit(
 _In_ FLT_FILTER_UNLOAD_FLAGS Flags
 );
 
@@ -96,6 +145,12 @@ _Flt_CompletionContext_Outptr_ PVOID *CompletionContext
 BOOLEAN
 CryptMiniDoRequestOperationStatus(
 _In_ PFLT_CALLBACK_DATA Data
+);
+
+VOID
+CleanupContext(
+__in PFLT_CONTEXT Context,
+__in FLT_CONTEXT_TYPE ContextType
 );
 
 /*************************************************************************
@@ -153,12 +208,27 @@ _In_ FLT_POST_OPERATION_FLAGS Flags
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(INIT, DriverEntry)
-#pragma alloc_text(PAGE, CryptMiniUnload)
+#pragma alloc_text(PAGE, DriveExit)
 #pragma alloc_text(PAGE, CryptMiniInstanceQueryTeardown)
 #pragma alloc_text(PAGE, CryptMiniInstanceSetup)
 #pragma alloc_text(PAGE, CryptMiniInstanceTeardownStart)
 #pragma alloc_text(PAGE, CryptMiniInstanceTeardownComplete)
 #endif
+
+//
+//  Context definitions we currently care about.  Note that the system will
+//  create a lookAside list for the volume context because an explicit size
+//  of the context is specified.
+//
+
+CONST FLT_CONTEXT_REGISTRATION ContextArray[] = {
+
+	{ FLT_VOLUME_CONTEXT, 0, CleanupContext, sizeof(VOLUME_CONTEXT), CONTEXT_TAG },
+
+	{ FLT_STREAM_CONTEXT, 0, CleanupContext, STREAM_CONTEXT_SIZE, STREAM_CONTEXT_TAG },
+
+	{ FLT_CONTEXT_END }
+};
 
 //
 //  operation registration
@@ -167,7 +237,7 @@ _In_ FLT_POST_OPERATION_FLAGS Flags
 CONST FLT_OPERATION_REGISTRATION Callbacks[] = {
 
 	{ IRP_MJ_CREATE,
-	0,
+	FLTFL_OPERATION_REGISTRATION_SKIP_PAGING_IO,
 	PreCreate,
 	PostCreate },
 
@@ -378,10 +448,10 @@ CONST FLT_REGISTRATION FilterRegistration = {
 	FLT_REGISTRATION_VERSION,           //  Version
 	0,                                  //  Flags
 
-	NULL,                               //  Context
+	ContextArray,                               //  Context
 	Callbacks,                          //  Operation callbacks
 
-	CryptMiniUnload,                           //  MiniFilterUnload
+	DriveExit,                           //  MiniFilterUnload
 
 	CryptMiniInstanceSetup,                    //  InstanceSetup
 	CryptMiniInstanceQueryTeardown,            //  InstanceQueryTeardown

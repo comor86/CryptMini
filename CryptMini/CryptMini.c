@@ -15,6 +15,121 @@ Environment:
 --*/
 #include "CryptMini.h"
 
+
+/*************************************************************************
+MiniFilter initialization and unload routines.
+*************************************************************************/
+
+NTSTATUS
+DriverEntry(
+_In_ PDRIVER_OBJECT DriverObject,
+_In_ PUNICODE_STRING RegistryPath
+)
+/*++
+
+Routine Description:
+
+This is the initialization routine for this miniFilter driver.  This
+registers with FltMgr and initializes all global data structures.
+
+Arguments:
+
+DriverObject - Pointer to driver object created by the system to
+represent this driver.
+
+RegistryPath - Unicode string identifying where the parameters for this
+driver are located in the registry.
+
+Return Value:
+
+Routine can return non success error codes.
+
+--*/
+{
+	NTSTATUS status;
+
+	UNREFERENCED_PARAMETER(RegistryPath);
+
+	LOG_PRINT(LOG_INFO,
+		("[CryptMini]DriverEntry: Entered\n"));
+
+	//  Pre2PostContextList结构体初始化
+	ExInitializeNPagedLookasideList(&Pre2PostContextList, NULL, NULL, 0, sizeof(PRE_2_POST_CONTEXT), PRE_2_POST_TAG, 0);
+
+
+	//注册minifilter
+	status = FltRegisterFilter(DriverObject,
+		&FilterRegistration,
+		&gFilterHandle);
+
+	FLT_ASSERT(NT_SUCCESS(status));
+
+	if (NT_SUCCESS(status)) 
+	{
+		//开启过滤之前创建与R3通信端口
+//		status = Msg_CreateCommunicationPort(gFilterHandle);
+		if (NT_SUCCESS(status))
+		{
+			//开启过滤
+			status = FltStartFiltering(gFilterHandle);
+
+			if (!NT_SUCCESS(status)) {
+
+				FltUnregisterFilter(gFilterHandle);
+			}
+		}
+	}
+
+	return status;
+}
+
+NTSTATUS
+DriveExit(
+_In_ FLT_FILTER_UNLOAD_FLAGS Flags
+)
+/*++
+
+Routine Description:
+
+This is the unload routine for this miniFilter driver. This is called
+when the minifilter is about to be unloaded. We can fail this unload
+request if this is not a mandatory unload indicated by the Flags
+parameter.
+
+Arguments:
+
+Flags - Indicating if this is a mandatory unload.
+
+Return Value:
+
+Returns STATUS_SUCCESS.
+
+--*/
+{
+	UNREFERENCED_PARAMETER(Flags);
+
+	PAGED_CODE();
+
+	LOG_PRINT(LOG_INFO,
+		("[CryptMini]DriveExit: Entered\n"));
+
+	//Close server port, must before filter is unregistered, otherwise filter will be halted.
+//	Msg_CloseCommunicationPort(g_pServerPort);
+
+	LOG_PRINT(LOG_INFO,
+		("[CryptMini]DriveExit: FltUnregisterFilter\n"));
+	FltUnregisterFilter(gFilterHandle);
+
+	//Delete lookaside list
+	LOG_PRINT(LOG_INFO,
+		("[CryptMini]DriveExit: ExDeleteNPagedLookasideList\n"));
+	ExDeleteNPagedLookasideList(&Pre2PostContextList);
+
+	return STATUS_SUCCESS;
+}
+
+
+
 NTSTATUS
 CryptMiniInstanceSetup (
     _In_ PCFLT_RELATED_OBJECTS FltObjects,
@@ -46,19 +161,135 @@ Return Value:
 
 --*/
 {
-    UNREFERENCED_PARAMETER( FltObjects );
-    UNREFERENCED_PARAMETER( Flags );
-    UNREFERENCED_PARAMETER( VolumeDeviceType );
-    UNREFERENCED_PARAMETER( VolumeFilesystemType );
+	UNREFERENCED_PARAMETER(Flags);
+	UNREFERENCED_PARAMETER(VolumeDeviceType);
+	UNREFERENCED_PARAMETER(VolumeFilesystemType);
 
-    PAGED_CODE();
+	PAGED_CODE();
 
-    PT_DBG_PRINT( PTDBG_TRACE_ROUTINES,
-                  ("CryptMini!CryptMiniInstanceSetup: Entered\n") );
+	LOG_PRINT(LOG_INFO,
+		("[CryptMini]CryptMiniInstanceSetup: Entered\n"));
 
-	DbgPrint(("CryptMini!CryptMiniInstanceSetup: Entered\n"));
+	NTSTATUS status = STATUS_SUCCESS;
+	PDEVICE_OBJECT devObj = NULL;
+	PVOLUME_CONTEXT ctx = NULL;
+	ULONG retLen;
+	PUNICODE_STRING workingName;
+	USHORT size;
+	UCHAR volPropBuffer[sizeof(FLT_VOLUME_PROPERTIES) + 512];
+	PFLT_VOLUME_PROPERTIES volProp = (PFLT_VOLUME_PROPERTIES)volPropBuffer;
 
-    return STATUS_SUCCESS;
+	UCHAR szIV[16] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 1, 2, 3, 4, 5, 6 };
+	UCHAR szKey[MAX_KEY_LENGTH] = { 0 };
+	UCHAR szKeyDigest[HASH_SIZE] = { 0 };
+	UCHAR uKeyLen = 32;
+
+	try {
+
+		//Allocate a volume context structure.
+		status = FltAllocateContext(FltObjects->Filter, FLT_VOLUME_CONTEXT, sizeof(VOLUME_CONTEXT), NonPagedPool, &ctx);
+		if (!NT_SUCCESS(status))
+			leave;
+
+		//Always get the volume properties, so I can get a sector size
+		status = FltGetVolumeProperties(FltObjects->Volume, volProp, sizeof(volPropBuffer), &retLen);
+		if (!NT_SUCCESS(status))
+			leave;
+
+		ASSERT((volProp->SectorSize == 0) || (volProp->SectorSize >= MIN_SECTOR_SIZE));
+		ctx->SectorSize = max(volProp->SectorSize, MIN_SECTOR_SIZE);
+		ctx->Name.Buffer = NULL;
+		ctx->FsName.Buffer = NULL;
+		///ctx->aes_ctr_ctx = NULL ;
+
+		//Get the storage device object we want a name for.
+		status = FltGetDiskDeviceObject(FltObjects->Volume, &devObj);
+		if (NT_SUCCESS(status))
+		{
+			status = RtlVolumeDeviceToDosName(devObj, &ctx->Name); //Try and get the DOS name.
+		}
+
+		//If we could not get a DOS name, get the NT name.
+		if (!NT_SUCCESS(status))
+		{
+			LOG_PRINT(LOG_ERROR,
+				("[CryptMini]CryptMiniInstanceSetup:  RtlVolumeDeviceToDosName failed\n"));
+
+			ASSERT(ctx->Name.Buffer == NULL);
+
+			//Figure out which name to use from the properties
+			if (volProp->RealDeviceName.Length > 0)
+			{
+				workingName = &volProp->RealDeviceName;
+				LOG_PRINT(LOG_ERROR,
+					("[CryptMini]CryptMiniInstanceSetup: RealDeviceName %wZ\n", &ctx->Name));
+			}
+			else if (volProp->FileSystemDeviceName.Length > 0)
+			{
+				workingName = &volProp->FileSystemDeviceName;
+				LOG_PRINT(LOG_ERROR,
+					("[CryptMini]CryptMiniInstanceSetup: FileSystemDeviceName %wZ\n", &ctx->Name));
+			}
+			else
+			{
+				status = STATUS_FLT_DO_NOT_ATTACH;  //No name, don't save the context
+				leave;
+			}
+
+			size = workingName->Length + sizeof(WCHAR); //length plus a trailing colon
+			ctx->Name.Buffer = ExAllocatePoolWithTag(NonPagedPool, size, NAME_TAG);
+			if (ctx->Name.Buffer == NULL)
+			{
+				status = STATUS_INSUFFICIENT_RESOURCES;
+				leave;
+			}
+			ctx->Name.Length = 0;
+			ctx->Name.MaximumLength = size;
+			RtlCopyUnicodeString(&ctx->Name, workingName);
+			RtlAppendUnicodeToString(&ctx->Name, L":");
+		}
+
+		//init aes ctr context
+		KeInitializeSpinLock(&ctx->FsCryptSpinLock);
+		///ctx->aes_ctr_ctx = counter_mode_ctx_init(szIV, g_szCurFileKey, uKeyLen) ;
+		///if (NULL == ctx->aes_ctr_ctx)
+		///{
+		///	leave  ;
+		///}
+
+
+		//init per-volume mutex
+		ExInitializeFastMutex(&ctx->FsCtxTableMutex);
+
+		//Set the context
+		status = FltSetVolumeContext(FltObjects->Volume, FLT_SET_CONTEXT_KEEP_IF_EXISTS, ctx, NULL);
+		if (status == STATUS_FLT_CONTEXT_ALREADY_DEFINED) //It is OK for the context to already be defined.
+			status = STATUS_SUCCESS;
+
+		LOG_PRINT(LOG_ERROR,
+			("[CryptMini]CryptMiniInstanceSetup:  %wZ\n", &ctx->Name));
+	}
+	finally {
+
+		if (ctx)
+		{
+			FltReleaseContext(ctx); // system will hang if not call this routine
+#if DBG			
+			if ((ctx->Name.Buffer[0] == L'C') || (ctx->Name.Buffer[0] == L'c'))
+			{
+				FltDeleteContext(ctx);
+				status = STATUS_FLT_DO_NOT_ATTACH;
+				LOG_PRINT(LOG_ERROR,
+					("[CryptMini]CryptMiniInstanceSetup:  system volume detach\n"));
+			}
+#endif
+		}
+
+		if (devObj)
+			ObDereferenceObject(devObj);//Remove the reference added by FltGetDiskDeviceObject.
+	}
+
+    return status;
 }
 
 
@@ -97,8 +328,8 @@ Return Value:
 
     PAGED_CODE();
 
-    PT_DBG_PRINT( PTDBG_TRACE_ROUTINES,
-                  ("CryptMini!CryptMiniInstanceQueryTeardown: Entered\n") );
+    LOG_PRINT( LOG_INFO,
+                  ("[CryptMini]CryptMiniInstanceQueryTeardown: Entered\n") );
 
     return STATUS_SUCCESS;
 }
@@ -133,8 +364,8 @@ Return Value:
 
     PAGED_CODE();
 
-    PT_DBG_PRINT( PTDBG_TRACE_ROUTINES,
-                  ("CryptMini!CryptMiniInstanceTeardownStart: Entered\n") );
+    LOG_PRINT( LOG_INFO,
+                  ("[CryptMini]CryptMiniInstanceTeardownStart: Entered\n") );
 }
 
 
@@ -167,110 +398,105 @@ Return Value:
 
     PAGED_CODE();
 
-    PT_DBG_PRINT( PTDBG_TRACE_ROUTINES,
-                  ("CryptMini!CryptMiniInstanceTeardownComplete: Entered\n") );
+    LOG_PRINT( LOG_INFO,
+                  ("[CryptMini]CryptMiniInstanceTeardownComplete: Entered\n") );
 }
 
 
-/*************************************************************************
-    MiniFilter initialization and unload routines.
-*************************************************************************/
-
-NTSTATUS
-DriverEntry (
-    _In_ PDRIVER_OBJECT DriverObject,
-    _In_ PUNICODE_STRING RegistryPath
-    )
+VOID
+CleanupContext(
+__in PFLT_CONTEXT Context,
+__in FLT_CONTEXT_TYPE ContextType
+)
 /*++
 
 Routine Description:
 
-    This is the initialization routine for this miniFilter driver.  This
-    registers with FltMgr and initializes all global data structures.
+The given context is being freed.
+Free the allocated name buffer if there one.
 
 Arguments:
 
-    DriverObject - Pointer to driver object created by the system to
-        represent this driver.
+Context - The context being freed
 
-    RegistryPath - Unicode string identifying where the parameters for this
-        driver are located in the registry.
+ContextType - The type of context this is
 
 Return Value:
 
-    Routine can return non success error codes.
+None
 
 --*/
 {
-    NTSTATUS status;
+	PVOLUME_CONTEXT ctx = NULL;
+	PSTREAM_CONTEXT streamCtx = NULL;
 
-    UNREFERENCED_PARAMETER( RegistryPath );
+	PAGED_CODE();
 
-    PT_DBG_PRINT( PTDBG_TRACE_ROUTINES,
-                  ("CryptMini!DriverEntry: Entered\n") );
+	UNREFERENCED_PARAMETER(ContextType);
 
-    //
-    //  Register with FltMgr to tell it our callback routines
-    //
+	//ASSERT(ContextType == FLT_VOLUME_CONTEXT);
+	LOG_PRINT(LOG_INFO,
+		("[CryptMini]CleanupContext: Entered\n"));
 
-    status = FltRegisterFilter( DriverObject,
-                                &FilterRegistration,
-                                &gFilterHandle );
+	switch (ContextType)
+	{
+	case FLT_VOLUME_CONTEXT:
+	{
+		LOG_PRINT(LOG_INFO,
+			("[CryptMini]CleanupContext: FLT_VOLUME_CONTEXT\n"));
 
-    FLT_ASSERT( NT_SUCCESS( status ) );
+		ctx = (PVOLUME_CONTEXT)Context;
 
-    if (NT_SUCCESS( status )) {
+		if (ctx->Name.Buffer != NULL)
+		{
+			LOG_PRINT(LOG_INFO,
+				("[CryptMini]CleanupContext: %wZ\n",&ctx->Name));
+			ExFreePool(ctx->Name.Buffer);
+			ctx->Name.Buffer = NULL;
+		}
 
-        //
-        //  Start filtering i/o
-        //
+		///if (NULL != ctx->aes_ctr_ctx)
+		///{
+		///	counter_mode_ctx_destroy(ctx->aes_ctr_ctx) ;
+		///	ctx->aes_ctr_ctx = NULL ;
+		///}
+	}
+	break;
+	case FLT_STREAM_CONTEXT:
+	{
+		LOG_PRINT(LOG_INFO,
+			("[CryptMini]CleanupContext: FLT_STREAM_CONTEXT\n"));
 
-        status = FltStartFiltering( gFilterHandle );
+		KIRQL OldIrql;
 
-        if (!NT_SUCCESS( status )) {
+		streamCtx = (PSTREAM_CONTEXT)Context;
 
-            FltUnregisterFilter( gFilterHandle );
-        }
-    }
+		if (streamCtx == NULL)
+			break;
 
-    return status;
+		if (streamCtx->FileName.Buffer != NULL)
+		{
+			ExFreePoolWithTag(streamCtx->FileName.Buffer, STRING_TAG);
+
+			streamCtx->FileName.Length = streamCtx->FileName.MaximumLength = 0;
+			streamCtx->FileName.Buffer = NULL;
+		}
+
+		///if (NULL != streamCtx->aes_ctr_ctx)
+		///{
+		///	counter_mode_ctx_destroy(streamCtx->aes_ctr_ctx) ;
+		///	streamCtx->aes_ctr_ctx = NULL ;
+		///}
+
+		if (NULL != streamCtx->Resource)
+		{
+			ExDeleteResourceLite(streamCtx->Resource);
+			ExFreePoolWithTag(streamCtx->Resource, RESOURCE_TAG);
+		}
+	}
+	break;
+	}
 }
-
-NTSTATUS
-CryptMiniUnload (
-    _In_ FLT_FILTER_UNLOAD_FLAGS Flags
-    )
-/*++
-
-Routine Description:
-
-    This is the unload routine for this miniFilter driver. This is called
-    when the minifilter is about to be unloaded. We can fail this unload
-    request if this is not a mandatory unload indicated by the Flags
-    parameter.
-
-Arguments:
-
-    Flags - Indicating if this is a mandatory unload.
-
-Return Value:
-
-    Returns STATUS_SUCCESS.
-
---*/
-{
-    UNREFERENCED_PARAMETER( Flags );
-
-    PAGED_CODE();
-
-    PT_DBG_PRINT( PTDBG_TRACE_ROUTINES,
-                  ("CryptMini!CryptMiniUnload: Entered\n") );
-
-    FltUnregisterFilter( gFilterHandle );
-
-    return STATUS_SUCCESS;
-}
-
 
 /*************************************************************************
     MiniFilter 自定义回调函数
@@ -287,8 +513,8 @@ _Flt_CompletionContext_Outptr_ PVOID *CompletionContext
 	UNREFERENCED_PARAMETER(FltObjects);
 	UNREFERENCED_PARAMETER(CompletionContext);
 
-	PT_DBG_PRINT(PTDBG_TRACE_ROUTINES,
-		("CryptMini!PreCreate: Entered\n"));
+	LOG_PRINT(LOG_INFO,
+		("[CryptMini]PreCreate: Entered\n"));
 
 	return FLT_PREOP_SUCCESS_WITH_CALLBACK;
 }
@@ -306,8 +532,8 @@ _In_ FLT_POST_OPERATION_FLAGS Flags
 	UNREFERENCED_PARAMETER(CompletionContext);
 	UNREFERENCED_PARAMETER(Flags);
 
-	PT_DBG_PRINT(PTDBG_TRACE_ROUTINES,
-		("CryptMini!PostCreate: Entered\n"));
+	LOG_PRINT(LOG_INFO,
+		("[CryptMini]PostCreate: Entered\n"));
 
 	return FLT_POSTOP_FINISHED_PROCESSING;
 }
@@ -323,10 +549,8 @@ _Flt_CompletionContext_Outptr_ PVOID *CompletionContext
 	UNREFERENCED_PARAMETER(FltObjects);
 	UNREFERENCED_PARAMETER(CompletionContext);
 
-	PT_DBG_PRINT(PTDBG_TRACE_ROUTINES,
-		("CryptMini!PreRead: Entered\n"));
-
-	DbgPrint(("CryptMini!PreRead: Entered\n"));
+	LOG_PRINT(LOG_INFO,
+		("[CryptMini]PreRead: Entered\n"));
 
 	return FLT_PREOP_SUCCESS_WITH_CALLBACK;
 }
@@ -344,10 +568,8 @@ _In_ FLT_POST_OPERATION_FLAGS Flags
 	UNREFERENCED_PARAMETER(CompletionContext);
 	UNREFERENCED_PARAMETER(Flags);
 
-	PT_DBG_PRINT(PTDBG_TRACE_ROUTINES,
-		("CryptMini!PostRead: Entered\n"));
-
-	DbgPrint(("CryptMini!PostRead: Entered\n"));
+	LOG_PRINT(LOG_INFO,
+		("[CryptMini]PostRead: Entered\n"));
 
 	return FLT_POSTOP_FINISHED_PROCESSING;
 }
@@ -363,8 +585,8 @@ _Flt_CompletionContext_Outptr_ PVOID *CompletionContext
 	UNREFERENCED_PARAMETER(FltObjects);
 	UNREFERENCED_PARAMETER(CompletionContext);
 
-	PT_DBG_PRINT(PTDBG_TRACE_ROUTINES,
-		("CryptMini!PreWrite: Entered\n"));
+	LOG_PRINT(LOG_INFO,
+		("[CryptMini]PreWrite: Entered\n"));
 
 	return FLT_PREOP_SUCCESS_WITH_CALLBACK;
 }
@@ -382,8 +604,8 @@ _In_ FLT_POST_OPERATION_FLAGS Flags
 	UNREFERENCED_PARAMETER(CompletionContext);
 	UNREFERENCED_PARAMETER(Flags);
 
-	PT_DBG_PRINT(PTDBG_TRACE_ROUTINES,
-		("CryptMini!PostWrite: Entered\n"));
+	LOG_PRINT(LOG_INFO,
+		("[CryptMini]PostWrite: Entered\n"));
 
 	return FLT_POSTOP_FINISHED_PROCESSING;
 }
@@ -427,8 +649,8 @@ Return Value:
     UNREFERENCED_PARAMETER( FltObjects );
     UNREFERENCED_PARAMETER( CompletionContext );
 
-    PT_DBG_PRINT( PTDBG_TRACE_ROUTINES,
-                  ("CryptMini!CryptMiniPreOperation: Entered\n") );
+    LOG_PRINT( LOG_INFO,
+                  ("[CryptMini]CryptMiniPreOperation: Entered\n") );
 
     //
     //  See if this is an operation we would like the operation status
@@ -446,8 +668,8 @@ Return Value:
                                                     (PVOID)(++OperationStatusCtx) );
         if (!NT_SUCCESS(status)) {
 
-            PT_DBG_PRINT( PTDBG_TRACE_OPERATION_STATUS,
-                          ("CryptMini!CryptMiniPreOperation: FltRequestOperationStatusCallback Failed, status=%08x\n",
+            LOG_PRINT( LOG_INFO,
+                          ("[CryptMini]CryptMiniPreOperation: FltRequestOperationStatusCallback Failed, status=%08x\n",
                            status) );
         }
     }
@@ -503,11 +725,11 @@ Return Value:
 {
     UNREFERENCED_PARAMETER( FltObjects );
 
-    PT_DBG_PRINT( PTDBG_TRACE_ROUTINES,
-                  ("CryptMini!CryptMiniOperationStatusCallback: Entered\n") );
+    LOG_PRINT( LOG_INFO,
+                  ("[CryptMini]CryptMiniOperationStatusCallback: Entered\n") );
 
-    PT_DBG_PRINT( PTDBG_TRACE_OPERATION_STATUS,
-                  ("CryptMini!CryptMiniOperationStatusCallback: Status=%08x ctx=%p IrpMj=%02x.%02x \"%s\"\n",
+    LOG_PRINT( LOG_INFO,
+                  ("[CryptMini]CryptMiniOperationStatusCallback: Status=%08x ctx=%p IrpMj=%02x.%02x \"%s\"\n",
                    OperationStatus,
                    RequesterContext,
                    ParameterSnapshot->MajorFunction,
@@ -555,8 +777,8 @@ Return Value:
     UNREFERENCED_PARAMETER( CompletionContext );
     UNREFERENCED_PARAMETER( Flags );
 
-    PT_DBG_PRINT( PTDBG_TRACE_ROUTINES,
-                  ("CryptMini!CryptMiniPostOperation: Entered\n") );
+    LOG_PRINT( LOG_INFO,
+                  ("[CryptMini]CryptMiniPostOperation: Entered\n") );
 
     return FLT_POSTOP_FINISHED_PROCESSING;
 }
@@ -597,8 +819,8 @@ Return Value:
     UNREFERENCED_PARAMETER( FltObjects );
     UNREFERENCED_PARAMETER( CompletionContext );
 
-    PT_DBG_PRINT( PTDBG_TRACE_ROUTINES,
-                  ("CryptMini!CryptMiniPreOperationNoPostOperation: Entered\n") );
+    LOG_PRINT( LOG_INFO,
+                  ("[CryptMini]CryptMiniPreOperationNoPostOperation: Entered\n") );
 
     // This template code does not do anything with the callbackData, but
     // rather returns FLT_PREOP_SUCCESS_NO_CALLBACK.

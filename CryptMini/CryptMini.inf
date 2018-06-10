@@ -5,11 +5,10 @@
 [Version]
 Signature   = "$Windows NT$"
 ; TODO - Change the Class and ClassGuid to match the Load Order Group value, see http://msdn.microsoft.com/en-us/windows/hardware/gg462963
-Class       = "Encryption"                         ;This is determined by the work this filter driver does
-ClassGuid   = {a0a701c0-a511-42ff-aa6c-06dc0395576f}    ;This value is determined by the Load Order Group value
-
-;Class       = "ActivityMonitor"
-;ClassGuid   = {b86dff51-a31e-4bac-b3cf-e8cfe75c9fc2}
+;Class       = "ActivityMonitor"                         ;This is determined by the work this filter driver does
+;ClassGuid   = {b86dff51-a31e-4bac-b3cf-e8cfe75c9fc2}    ;This value is determined by the Class
+Class       = "Encryption"                         
+ClassGuid   = {a0a701c0-a511-42ff-aa6c-06dc0395576f} 
 Provider    = %ManufacturerName%
 DriverVer   = 
 CatalogFile = CryptMini.cat
@@ -97,5 +96,5 @@ DefaultInstance         = "CryptMini Instance"
 Instance1.Name          = "CryptMini Instance"
 ; TODO - Change the altitude value, see http://connect.microsoft.com/site221/content/content.aspx?ContentID=2512
 ;Instance1.Altitude      = "370030"
-Instance.Altitude       = "141000"
+Instance1.Altitude       = "141000"
 Instance1.Flags         = 0x0              ; Allow all attachments

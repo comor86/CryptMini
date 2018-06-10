@@ -51,6 +51,7 @@
     </ProjectConfiguration>
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="ctx.c" />
     <ResourceCompile Include="CryptMini.rc" />
     <ClCompile Include="CryptMini.c" />
     <Inf Include="CryptMini.inf" />
@@ -217,6 +218,9 @@
     <Link>
       <AdditionalDependencies>$(DDK_LIB_PATH)\fltmgr.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
+    <ClCompile>
+      <TreatWarningAsError>false</TreatWarningAsError>
+    </ClCompile>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Win7 Release|Win32'">
     <Link>
@@ -258,7 +262,12 @@
     <FilesToPackage Include="@(Inf->'%(CopyOutput)')" Condition="'@(Inf)'!=''" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="..\include\error.h" />
+    <ClInclude Include="..\include\interface.h" />
+    <ClInclude Include="..\include\iocommon.h" />
+    <ClInclude Include="common.h" />
     <ClInclude Include="CryptMini.h" />
+    <ClInclude Include="ctx.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
